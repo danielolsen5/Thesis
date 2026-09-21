@@ -1,1 +1,331 @@
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from matplotlib.path import Path
+from scipy.interpolate import RegularGridInterpolator
 
+# === DEBUG TOGGLE ===
+DEBUG = False
+Plot = False
+Print = True
+
+# Global variables
+V_inf = 10.0             # freestream velocity magnitude
+a_deg = 10              # angle alpha in deg
+a = np.radians(a_deg)
+P_inf = 101325.0         # free stream pressure Pa
+rho = 1.225              # air density kg/m^3
+c = 1.0                  # chord length
+
+# Read geometry from JSON
+print(os.getcwd())
+coordinates = np.loadtxt("input.txt")
+
+x = coordinates[:, 0]
+y = coordinates[:, 1]
+
+# geometry
+n = len(x)
+n_pan = n - 1
+
+
+"""
+VPM Formulation
+"""
+
+#panel lengths 
+dx = x[1:] - x[:-1]
+dy = y[1:] - y[:-1]
+l  = np.sqrt(dx**2 + dy**2)
+
+# B
+B = V_inf * ((dy * np.cos(a)) - (dx * np.sin(a))) / l
+B = np.append(B, 0)
+
+# control points
+xc = 0.5 * (x[:-1] + x[1:])
+yc = 0.5 * (y[:-1] + y[1:])
+if DEBUG:
+    print("xc:", xc)
+    print("yc:", yc)
+
+# build A 1.6.25
+def build_A(x, y, xc, yc, dx, dy, l, DEBUG=False):
+    n_pan = len(dx)
+    A = np.zeros((n, n), dtype=float)
+    eps = 1e-15
+
+    for i in range(n-1):
+        
+        # outward unit normal at control point i 
+        nx = dx[i] / l[i]
+        ny = -dy[i] / l[i]
+
+        for j in range(n-1):
+            dxj = dx[j]; dyj = dy[j]; lj = l[j]
+
+            #1.6.20  xi, eta in panel-j coordinates
+            # use panel j to build the local frame 
+            M = np.array([[dxj,  dyj],
+                           [-dyj, dxj]])   # transform for panel j
+
+            #1.6.20
+            # vector from panel-j start to control point i
+            N = np.array([xc[i] - x[j], yc[i] - y[j]])
+
+            xi_eta = (1.0 / lj) * M.dot(N)   # [xi, eta]
+            xi = float(xi_eta[0])
+            eta = float(xi_eta[1])
+
+            # phi 1.6.21
+            phi = np.arctan2(eta * lj, (eta**2 + xi**2 - xi * lj))
+            
+            # psi 1.6.22
+            num = xi**2 + eta**2
+            den = (xi - lj)**2 + eta**2
+            psi = 0.5 * np.log(num / (den ))
+
+            # P 1.6.23
+            W = np.array([
+                [(lj - xi) * phi + (eta * psi),       xi * phi - eta * psi],
+                [eta * phi - (lj - xi) * psi - lj,  -eta * phi - xi * psi + lj]
+            ])
+            
+            V = np.array([[dxj,  -dyj],
+                           [dyj, dxj]])
+
+            # P 
+            P = (1.0 / (2.0 * np.pi * lj**2)) * (np.matmul(V, W))
+            
+            # construct P matrix for velocity at a point
+            W = np.array([
+                [(lj - xi) * phi + (eta * psi),       xi * phi - eta * psi],
+                [eta * phi - (lj - xi) * psi - lj,  -eta * phi - xi * psi + lj]
+                ])
+
+            # build A
+            A[i, j] += nx * P[1, 0] + ny * P[0, 0]
+            A[i, (j + 1) ] += nx * P[1, 1] + ny * P[0, 1]
+
+            if DEBUG and (i, j) in ((0,0), (0,1), (0,2)):
+                print("\nDEBUG: influence of panel j={} on cp i={}".format(j, i))
+                print(" panel j start (x,y) = ({:.12e}, {:.12e})".format(x[j], y[j]))
+                print(" panel j end   (x,y) = ({:.12e}, {:.12e})".format(x[j+1], y[j+1]))
+                print(" cp (x,y) = ({:.12e}, {:.12e})".format(xc[i], yc[i]))
+                print(" panel length l_j = {:.12e}".format(lj))
+                print("    xi = {:.15e}".format(xi))
+                print("   eta = {:.15e}".format(eta))
+                print("   psi = {:.15e}".format(psi))
+                print("   phi = {:.15e}".format(phi))
+                print("   M =\n", M)
+                print("   N =\n", N)
+                print("   P =\n", P)
+    return A
+
+A = build_A(x, y, xc, yc, dx, dy, l, DEBUG=False)
+A[-1,:] = 0.0
+A[-1,0] = 1.0
+A[-1,n-1] = 1.0
+A[-1,-1] = 1.0
+
+
+gamma = np.linalg.solve(A, B)
+
+"""
+Streamline Formulation
+"""
+if Plot: 
+    # grid for streamlines/velocity
+    n_grid = 200
+    x_start, x_end = -0.5, 1.5
+    y_start, y_end = -0.5, 0.5
+
+    #np.meshgrid(x_vals, y_vals) with default indexing='xy' returns X.shape==(ny, nx)
+    x_vals = np.linspace(x_start, x_end, n_grid)
+    y_vals = np.linspace(y_start, y_end, n_grid)
+    X, Y = np.meshgrid(x_vals, y_vals)
+
+    # RK4 step-size 
+    h_stream = 0.001
+
+    # velocity at a point 
+    def calculate_velocity(X, Y, x, y, n_pan, gamma, V_inf, a):
+
+        # initialize velocity field
+        u = np.full_like(X, V_inf * np.cos(a))  # freestream u
+        v = np.full_like(Y, V_inf * np.sin(a))  # freestream v
+
+        # Panel geometry
+        dx_panel = x[1:] - x[:-1]
+        dy_panel = y[1:] - y[:-1]
+        l_panel = np.sqrt(dx_panel**2 + dy_panel**2)
+
+        # Add influence of each vortex panel to the velocity field
+        for j in range(n_pan):
+            dxj, dyj, lj = dx_panel[j], dy_panel[j], l_panel[j]
+
+            # Transform grid points to the panel's local coordinate system
+            N_x = X - x[j]
+            N_y = Y - y[j]
+            xi = (N_x * dxj + N_y * dyj) / lj
+            eta = (-N_x * dyj + N_y * dxj) / lj
+
+            # Calculate phi and psi (same as in build_A)
+            phi = np.arctan2(eta * lj, (eta**2 + xi**2 - xi * lj + 1e-12))
+            psi = 0.5 * np.log(((xi**2 + eta**2) / ((xi - lj)**2 + eta**2 + 1e-12)) + 1e-12)
+
+            # W matrix elements
+            W11 = (lj - xi) * phi + eta * psi
+            W12 = xi * phi - eta * psi
+            W21 = eta * phi - (lj - xi) * psi - lj
+            W22 = -eta * phi - xi * psi + lj
+
+            # induced velocities
+            u_induced = (1 / (2 * np.pi * lj**2)) * (
+                (dxj * W11 - dyj * W21) * gamma[j] + (dxj * W12 - dyj * W22) * gamma[j+1]
+            )
+            v_induced = (1 / (2 * np.pi * lj**2)) * (
+                (dyj * W11 + dxj * W21) * gamma[j] + (dyj * W12 + dxj * W22) * gamma[j+1]
+            )
+            u += u_induced
+            v += v_induced
+
+        return u, v
+
+    # compute velocity field
+    u_field, v_field = calculate_velocity(X, Y, x, y, n_pan, gamma, V_inf, a)
+
+    # RK4 streamline integrator
+    def calculate_single_streamline_rk4(x_start, y_start, h, n_steps, x_range, y_range, u_field, v_field):
+        # RegularGridInterpolator expects (y, x) order for grid points
+        interp_u = RegularGridInterpolator((y_range, x_range), u_field)
+        interp_v = RegularGridInterpolator((y_range, x_range), v_field)
+
+        def get_velocity(point):
+            try:
+                # Interpolator expects [y, x]
+                u = interp_u([point[1], point[0]])[0]
+                v = interp_v([point[1], point[0]])[0]
+                return np.array([u, v])
+            except ValueError:
+                # Point is outside the interpolation grid
+                return np.array([np.nan, np.nan])
+
+        streamline_points = np.zeros((n_steps, 2))
+        streamline_points[0] = [x_start, y_start]
+        current_point = np.array([x_start, y_start])
+
+        for i in range(1, n_steps):
+            k1 = get_velocity(current_point)
+            if np.isnan(k1).any():
+                streamline_points[i:] = np.nan
+                break
+            k2 = get_velocity(current_point + 0.5 * h * k1)
+            if np.isnan(k2).any():
+                streamline_points[i:] = np.nan
+                break
+            k3 = get_velocity(current_point + 0.5 * h * k2)
+            if np.isnan(k3).any():
+                streamline_points[i:] = np.nan
+                break
+            k4 = get_velocity(current_point + h * k3)
+            if np.isnan(k4).any():
+                streamline_points[i:] = np.nan
+                break
+
+            new_point = current_point + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            streamline_points[i] = new_point
+            current_point = new_point
+        
+            # Check if point left the domain boundaries
+            if not (x_start <= new_point[0] <= x_end and y_start <= new_point[1] <= y_end):
+                streamline_points[i:] = np.nan # Mark remaining points as invalid
+                break
+
+        return streamline_points
+
+    # plotting 
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Plot the airfoil
+    ax.fill(x, y, color='lightgray', edgecolor='black', linewidth=1, zorder=3)
+
+
+    # Plot multiple streamlines using RK4
+
+    x_range = x_vals # X[0, :]
+    y_range = y_vals # Y[:, 0]
+    n_steps = 5000   # Max steps per streamline
+
+    # Define starting points for the streamlines
+    n_streamlines = 50
+    y_starts = np.linspace(y_start, y_end, n_streamlines)
+    x_start_val = x_start # Start all streamlines from the left boundary
+
+    for y0 in y_starts:
+        # Calculate one streamline
+        sl_points = calculate_single_streamline_rk4(
+            x_start_val, y0,
+            h_stream, n_steps,
+            x_range, y_range,
+            u_field, v_field
+        )
+    
+        # Plot the calculated streamline
+        ax.plot(sl_points[:, 0], sl_points[:, 1],
+                color='blue', linewidth=0.8, zorder=2) # zorder=2 puts lines behind airfoil edge
+
+
+    # Formatting
+    ax.set_xlim(x_start, x_end)
+    ax.set_ylim(y_start, y_end)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_title(f'Streamlines at {np.degrees(a):.1f}° AoA', fontsize=14)
+    ax.set_xlabel('x / c', fontsize=12)
+    ax.set_ylabel('y / c', fontsize=12)
+    plt.show()
+
+
+# Section lift 1.6.32
+def calculate_lift_coefficient(l, gamma, c, V_inf):
+
+    C_L = 0  # Initialize the lift coefficient 
+    n = len(l)
+
+     #Loop through each segment from i=0 to n-1
+    for i in range(n):
+        segment_contribution = (l[i] / c) * ((gamma[i] + gamma[i+1]) / V_inf)
+        C_L += segment_contribution  # Add the segment's contribution to the total
+    return C_L
+   
+
+
+# leading edge moment 
+def calculate_moment(x, y, gamma, c, l, V_inf, a):
+    C_mle = 0 # initialize value
+    for i in range(n - 1):  # stop one short to avoid index overflow
+        sx = 2*x[i]*gamma[i] + x[i]*gamma[i+1] + x[i+1]*gamma[i] + 2*x[i+1]*gamma[i+1]
+        sy = 2*y[i]*gamma[i] + y[i]*gamma[i+1] + y[i+1]*gamma[i] + 2*y[i+1]*gamma[i+1]
+        
+        panel_contribution = (l[i] / c) * (
+            (sx * np.cos(a) / (V_inf * c)) +
+            (sy * np.sin(a) / (V_inf * c))
+        )
+        C_mle += (-1/3) * panel_contribution
+
+    return C_mle
+
+"""
+Calculation printouts
+"""
+if Print: 
+    C_L = calculate_lift_coefficient(l, gamma, c, V_inf)
+    print(f"Lift Coefficient: {C_L:.5f} ")
+
+    C_mle = calculate_moment(x, y, gamma, c, l, V_inf, a)
+    print(f"Leading-edge Moment Coefficient: {C_mle:.5f}")
+
+    C_qc = C_mle + (.25 * C_L)
+    print(f"Quarter Chord Moment Coefficient: {C_qc:.5f}")
+    
