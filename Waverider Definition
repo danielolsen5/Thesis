@@ -1,0 +1,633 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from matplotlib.collections import LineCollection
+from scipy.interpolate import RegularGridInterpolator, griddata
+
+
+#----------------------------------
+# Toggle Features
+#----------------------------------
+
+Debug  =True
+Grid = False # print figure with grid
+Stream = True # streamline tracing
+Plot = True # plot all figures
+
+#-----------------------------
+# Constants and Freestream
+#-----------------------------
+"""
+Constants
+"""
+g = 9.81      # Gravitational acceleration
+gamma = 1.4   # compressibility constant
+R = 287       # Univeral gas constant (j/Kg*K)
+L = -.0065    # temperature change with altitude (K\m)
+ 
+
+"""
+Free Stream Conditions Based on altitude    
+"""
+M_inf = 5                                         # Freestream Mach number
+Alt = 15000                                       # Altitude (m)
+T_o = 288.15 + (L*Alt)                            # Freestream temperature (K)
+g = 9.81 * (1+ (Alt/6371000))**(-2)                 # Gravitational Acceleration at altitude (m/s^2)
+p_o = 101325 *(T_o/288.15)**(-g/(R*L))            # Freestream pressure (Pa)
+rho_o = (p_o / (R * T_o))                         # Freestream density (kg/m^3)
+a_o = np.sqrt(gamma * R * T_o)                    # Freestream speed of sound (m/s)
+V_o = M_inf * a_o                                 # Freestream velocity (m/s)
+
+if Debug:
+    # Freestream Conditions Check
+    print(f"Freestream Temperature: {T_o:.1f}K")
+    print(f"Freestream Pressure: {p_o/1000:.1f}Kpa")
+    print(f"Freestream Density: {rho_o:.3f}Kg/m^3")
+    print(f"Freestream Speed of Sound: {a_o:.3f}m/s")
+    print(f"Freestream Velocity: {V_o:.3f}m/s")
+    print(f"Gravitational Acceleration: {g:.2f}")
+
+"""
+Cone and Shock Definition
+"""
+# define shock based on cone set z=1
+# define cone based on shock set z=2
+z = 1
+l = 5       #Cone length
+phi = np.radians(8.0)
+beta = np.radians(20)
+
+if z == 1:
+    # Redefine beta from taylor Maccoll correlation  
+    beta = np.arcsin(np.sqrt((gamma + 1) / 2.0 * np.sin(phi)**2 + M_inf**(-2)))
+else:
+    # Define phi from the shock angle
+    phi = np.arcsin(np.sqrt((np.sin(beta)**2 - M_inf**(-2))*(2/(gamma+1))))
+
+if Debug:
+    print(f"Cone Angle: {np.degrees(phi):.2f}") 
+    print(f"Shock Angle: {np.degrees(beta):.2f}")
+    if z==1:
+        print("Shock defined by cone angle")
+    else:
+        print("Cone angle defined by shock")
+
+#----------------------------------------------
+# Finite Difference step and initial point
+#----------------------------------------------
+x_init = .05
+num_pts = 20
+
+#--------------------
+# Structure Data
+#-------------------
+
+# Define properties of interest at each point in the flow for later callback
+@dataclass
+class Flowpoint:
+    x: float
+    y: float
+    V: float
+    theta: float
+    p: float
+    rho: float
+    
+    @property
+    def a(self) -> float:
+        return np.sqrt(gamma * self.p / self.rho)
+
+    @property
+    def M(self) -> float:
+        return self.V / self.a
+
+    @property
+    def alpha(self) -> float:
+        return np.arcsin(np.clip(1.0 / self.M, -1.0, 1.0))
+
+    @property
+    def T(self) -> float:
+        return self.p / (self.rho * R) 
+    
+#------------------
+# Thermo Relation
+#------------------
+
+def get_thermo(V: float, p: float, rho: float):
+    a = np.sqrt(gamma * p / rho)
+    M = V / a
+    alpha = np.arcsin(np.clip(1.0/M, -1, 1))
+    return a, M, alpha
+
+#--------------------------------------------------
+# Populate Initial Vlaue Line with Taylor Maccoll
+#--------------------------------------------------
+
+def initial_data(theta_ray: float):
+    # radial and circumferential velocity
+    u_r = V_o * (1.0 - 0.5 * theta_ray**2 + phi**2 * np.log(theta_ray / beta))
+    v_theta = V_o * (-theta_ray + phi**2 / theta_ray)
+    
+    # combine velocity components
+    V = np.hypot(u_r, v_theta)
+    # Define streamline flow angle
+    theta_flow = theta_ray + np.arctan2(v_theta, u_r)
+    
+    # Temperature and pressure distributions in shock layer
+    T = T_o * (1.0 + 0.5 * (gamma - 1.0) * M_inf**2 * phi**2 * (
+        2.0 - (phi / theta_ray)**2 - np.log((theta_ray / beta)**2)
+    ))
+    
+    p = p_o * (1.0 + 0.5 * gamma * M_inf**2 * phi**2 * (
+        2.0 + (phi / beta)**2 - (phi / theta_ray)**2 - np.log((theta_ray / beta)**2)
+    ))
+    
+    rho = p / (R * T)
+    return V, theta_flow, p, rho
+
+# Define the initial data line inside of the shock connecting to the cone
+def initialize_data_line(x_init: float = 0.5, num_pts: int = 20):
+
+    theta_rays = np.linspace(phi, beta, num_pts)
+    init_line = []
+    for th_r in theta_rays:
+        y_pt = x_init * np.tan(th_r)
+        V, th_flow, p, rho = initial_data(th_r)
+        init_line.append(Flowpoint(x=x_init, y=y_pt, V=V, theta=th_flow, p=p, rho=rho))
+    return init_line
+
+
+
+
+#----------------------------------------------
+# MOC Interior and Wall solver
+#----------------------------------------------
+
+#Find point at streamline intersection for point 3
+def find_point3(pt1: Flowpoint, pt2: Flowpoint, x4: float, y4: float, theta_4_est: float = None, tol: float = 1e-7, max_iter: int = 20):
+    
+    theta3 = 0.5 * (pt1.theta + pt2.theta)
+    dx_12 = pt1.x - pt2.x
+    dy_12 = pt1.y - pt2.y
+    for _ in range(max_iter):
+        # Slope of streamline C_o
+        theta_o = theta3 if theta_4_est is None else 0.5 * (theta3 + theta_4_est)
+        lam_o = np.tan(theta_o)
+        # Parametric intersection s in [0, 1] along segment pt2 -> pt1:
+        denom = dy_12 - lam_o * dx_12
+        if abs(denom) < 1e-12:
+            s = 0.5
+        else:
+            s = ((y4 - pt2.y) - lam_o * (x4 - pt2.x)) / denom
+        s = np.clip(s, 0.0, 1.0)
+    
+        x3 = pt2.x + s * dx_12
+        y3 = pt2.y + s * dy_12
+    
+        # interpolate state variables at Point 3
+        theta3_new = pt2.theta + s * (pt1.theta - pt2.theta)
+        if abs(theta3_new - theta3) < tol:
+            theta3 = theta3_new
+            break
+        theta3 = theta3_new
+        
+        V3 = pt2.V + s * (pt1.V - pt2.V)
+        p3 = pt2.p + s * (pt1.p - pt2.p)
+        rho3 = pt2.rho + s * (pt1.rho - pt2.rho)
+        return Flowpoint(x=x3, y=y3, V=V3, theta=theta3, p=p3, rho=rho3)
+    
+    # Solve pt 4 from point 1 and 2: Predictor Corrector steps 
+    
+def solve_interior_point(pt1: Flowpoint, pt2: Flowpoint) -> Flowpoint:
+        # PREDICTOR STEP
+        lam_plus = np.tan(pt2.theta + pt2.alpha)  
+        lam_minus = np.tan(pt1.theta - pt1.alpha)  
+
+        # Solve (x4, y4)
+        A_mat = np.array([[-lam_plus, 1.0],
+                        [-lam_minus, 1.0]])
+        b_vec = np.array([pt2.y - lam_plus * pt2.x,
+                        pt1.y - lam_minus * pt1.x])
+        x4_pred, y4_pred = np.linalg.solve(A_mat, b_vec)
+
+        # Locate Point 3 and  properties along  1-2
+        pt3_pred = find_point3(pt1, pt2, x4_pred, y4_pred)
+
+        # Compatibility coefficients along C+ (pt2) and C- (pt1)
+        Q_plus = np.sqrt(pt2.M**2 - 1.0) / (pt2.rho * pt2.V**2)
+        S_plus = np.sin(pt2.theta) / (pt2.y * pt2.M * np.cos(pt2.theta + pt2.alpha))
+
+        Q_minus = np.sqrt(pt1.M**2 - 1.0) / (pt1.rho * pt1.V**2)
+        S_minus = np.sin(pt1.theta) / (pt1.y * pt1.M * np.cos(pt1.theta - pt1.alpha))
+
+        T_plus = -S_plus * (x4_pred - pt2.x) + Q_plus * pt2.p + pt2.theta
+        T_minus = -S_minus * (x4_pred - pt1.x) + Q_minus * pt1.p - pt1.theta
+
+        # Solve for predicted p4 and theta4
+        p4_pred = (T_plus + T_minus) / (Q_plus + Q_minus)
+        theta4_pred = T_plus - Q_plus * p4_pred
+
+        # Streamline  for predicted V4 and rho4
+        R_o = pt3_pred.rho * pt3_pred.V
+        A_o = pt3_pred.a**2
+        V4_pred = pt3_pred.V + (pt3_pred.p - p4_pred) / R_o
+        rho4_pred = pt3_pred.rho + (p4_pred - pt3_pred.p) / A_o
+
+        # CORRECTOR STEP
+        # Average properties along C+, C-, and C_o characteristics
+        V_pl = 0.5 * (pt2.V + V4_pred)
+        th_pl = 0.5 * (pt2.theta + theta4_pred)
+        p_pl = 0.5 * (pt2.p + p4_pred)
+        rho_pl = 0.5 * (pt2.rho + rho4_pred)
+        y_pl = 0.5 * (pt2.y + y4_pred)
+        _, M_pl, alpha_pl = get_thermo(V_pl, p_pl, rho_pl)
+
+        V_mi = 0.5 * (pt1.V + V4_pred)
+        th_mi = 0.5 * (pt1.theta + theta4_pred)
+        p_mi = 0.5 * (pt1.p + p4_pred)
+        rho_mi = 0.5 * (pt1.rho + rho4_pred)
+        y_mi = 0.5 * (pt1.y + y4_pred)
+        _, M_mi, alpha_mi = get_thermo(V_mi, p_mi, rho_mi)
+
+        # Recompute characteristic slopes and Point 4 coordinates
+        lam_plus_c = np.tan(th_pl + alpha_pl)
+        lam_minus_c = np.tan(th_mi - alpha_mi)
+
+        A_mat_c = np.array([[-lam_plus_c, 1.0],
+                            [-lam_minus_c, 1.0]])
+        b_vec_c = np.array([pt2.y - lam_plus_c * pt2.x,
+                            pt1.y - lam_minus_c * pt1.x])
+        x4_corr, y4_corr = np.linalg.solve(A_mat_c, b_vec_c)
+
+        # Re-evaluate Point 3 using average streamline slope
+        pt3_corr = find_point3(pt1, pt2, x4_corr, y4_corr, theta_4_est=theta4_pred)
+
+        # Recompute compatibility coefficients using averaged states
+        Q_plus_c = np.sqrt(M_pl**2 - 1.0) / (rho_pl * V_pl**2)
+        S_plus_c = np.sin(th_pl) / (y_pl * M_pl * np.cos(th_pl + alpha_pl))
+
+        Q_minus_c = np.sqrt(M_mi**2 - 1.0) / (rho_mi * V_mi**2)
+        S_minus_c = np.sin(th_mi) / (y_mi * M_mi * np.cos(th_mi - alpha_mi))
+
+        T_plus_c = -S_plus_c * (x4_corr - pt2.x) + Q_plus_c * pt2.p + pt2.theta
+        T_minus_c = -S_minus_c * (x4_corr - pt1.x) + Q_minus_c * pt1.p - pt1.theta
+
+        p4_corr = (T_plus_c + T_minus_c) / (Q_plus_c + Q_minus_c)
+        theta4_corr = T_plus_c - Q_plus_c * p4_corr
+
+        # Averaged streamline coefficients
+        V_o_avg = 0.5 * (pt3_corr.V + V4_pred)
+        p_o_avg = 0.5 * (pt3_corr.p + p4_pred)
+        rho_o_avg = 0.5 * (pt3_corr.rho + rho4_pred)
+        a_o_avg, _, _ = get_thermo(V_o_avg, p_o_avg, rho_o_avg)
+
+        R_o_c = rho_o_avg * V_o_avg
+        A_o_c = a_o_avg**2
+
+        V4_corr = pt3_corr.V + (pt3_corr.p - p4_corr) / R_o_c
+        rho4_corr = pt3_corr.rho + (p4_corr - pt3_corr.p) / A_o_c
+
+        return Flowpoint(x=x4_corr, y=y4_corr, V=V4_corr, theta=theta4_corr, p=p4_corr, rho=rho4_corr)
+    
+# find point 4 if it is a wall value    
+def solve_wall_point(pt1: Flowpoint, pt_wall_prev: Flowpoint) -> Flowpoint:
+  
+    tan_phi = np.tan(phi)
+    theta4 = phi  # Flow is tangent to the cone surface
+
+    # PREDICTOR 
+    lam_minus = np.tan(pt1.theta - pt1.alpha)
+    x4_pred = (pt1.y - lam_minus * pt1.x) / (tan_phi - lam_minus)
+    y4_pred = x4_pred * tan_phi
+
+    Q_minus = np.sqrt(pt1.M**2 - 1.0) / (pt1.rho * pt1.V**2)
+    S_minus = np.sin(pt1.theta) / (pt1.y * pt1.M * np.cos(pt1.theta - pt1.alpha))
+    T_minus = -S_minus * (x4_pred - pt1.x) + Q_minus * pt1.p - pt1.theta
+
+    p4_pred = (T_minus + theta4) / Q_minus
+    R_o = pt_wall_prev.rho * pt_wall_prev.V
+    A_o = pt_wall_prev.a**2
+    V4_pred = pt_wall_prev.V + (pt_wall_prev.p - p4_pred) / R_o
+    rho4_pred = pt_wall_prev.rho + (p4_pred - pt_wall_prev.p) / A_o
+
+    # CORRECTOR 
+    V_mi = 0.5 * (pt1.V + V4_pred)
+    th_mi = 0.5 * (pt1.theta + theta4)
+    p_mi = 0.5 * (pt1.p + p4_pred)
+    rho_mi = 0.5 * (pt1.rho + rho4_pred)
+    y_mi = 0.5 * (pt1.y + y4_pred)
+    _, M_mi, alpha_mi = get_thermo(V_mi, p_mi, rho_mi)
+
+    lam_minus_c = np.tan(th_mi - alpha_mi)
+    x4_corr = (pt1.y - lam_minus_c * pt1.x) / (tan_phi - lam_minus_c)
+    y4_corr = x4_corr * tan_phi
+
+    Q_minus_c = np.sqrt(M_mi**2 - 1.0) / (rho_mi * V_mi**2)
+    S_minus_c = np.sin(th_mi) / (y_mi * M_mi * np.cos(th_mi - alpha_mi))
+    T_minus_c = -S_minus_c * (x4_corr - pt1.x) + Q_minus_c * pt1.p - pt1.theta
+
+    p4_corr = (T_minus_c + theta4) / Q_minus_c
+
+    V_o_avg = 0.5 * (pt_wall_prev.V + V4_pred)
+    p_o_avg = 0.5 * (pt_wall_prev.p + p4_pred)
+    rho_o_avg = 0.5 * (pt_wall_prev.rho + rho4_pred)
+    a_o_avg, _, _ = get_thermo(V_o_avg, p_o_avg, rho_o_avg)
+
+    R_o_c = rho_o_avg * V_o_avg
+    A_o_c = a_o_avg**2
+    V4_corr = pt_wall_prev.V + (pt_wall_prev.p - p4_corr) / R_o_c
+    rho4_corr = pt_wall_prev.rho + (p4_corr - pt_wall_prev.p) / A_o_c
+
+    return Flowpoint(x=x4_corr, y=y4_corr, V=V4_corr, theta=theta4, p=p4_corr, rho=rho4_corr)
+
+#-----------------------------
+# Spacial marching
+#-----------------------------
+
+current_line = initialize_data_line(x_init=x_init, num_pts=num_pts)
+all_lines = [current_line]
+c_plus_segments = []
+c_minus_segments = []
+
+# Values directly downstream the shock
+V_shock, th_shock, p_shock, rho_shock = initial_data(beta)
+
+while current_line[0].x < l:
+    # --- HALF-STEP A: N points -> N-1 staggered interior points ---
+    half_line = []
+    for i in range(len(current_line) - 1):
+        pt2 = current_line[i]      # Lower point (C+ line)
+        pt1 = current_line[i + 1]  # Upper point (C- line)
+        pt4 = solve_interior_point(pt1, pt2)
+        half_line.append(pt4)
+
+        c_plus_segments.append(((pt2.x, pt2.y), (pt4.x, pt4.y)))
+        c_minus_segments.append(((pt1.x, pt1.y), (pt4.x, pt4.y)))
+
+    all_lines.append(half_line)
+
+    # HALF-STEP B: N-1 points -> N points (Wall + N-2 Interior + Shock) ---
+    interior_pts = []
+    for i in range(len(half_line) - 1):
+        pt2 = half_line[i]         # Lower point (C+ line)
+        pt1 = half_line[i + 1]     # Upper point (C- line)
+        pt4 = solve_interior_point(pt1, pt2)
+        interior_pts.append(pt4)
+
+        c_plus_segments.append(((pt2.x, pt2.y), (pt4.x, pt4.y)))
+        c_minus_segments.append(((pt1.x, pt1.y), (pt4.x, pt4.y)))
+
+    # Bottom boundary on the cone wall
+    wall_pt = solve_wall_point(half_line[0], current_line[0])
+    c_minus_segments.append(((half_line[0].x, half_line[0].y), (wall_pt.x, wall_pt.y)))
+
+    # Top boundary on the shock
+    x_top = interior_pts[-1].x
+    shock_pt = Flowpoint(
+        x=x_top,
+        y=x_top * np.tan(beta),
+        V=V_shock,
+        theta=th_shock,
+        p=p_shock,
+        rho=rho_shock
+    )
+
+    # Reassemble full N-point front: 1 (wall) + (N-2) (interior) + 1 (shock) = N
+    next_line = [wall_pt] + interior_pts + [shock_pt]
+    all_lines.append(next_line)
+    current_line = next_line
+    
+#---------------------------
+# MOC Visualization
+# -------------------------
+
+if Plot:
+    
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    #Cone and Shock Geometry Arrays
+    x_geom = np.linspace(0, l, 100)
+    y_cone = x_geom * np.tan(phi)
+    y_shock = x_geom * np.tan(beta)
+
+    # --- Plot 1: Characteristic Mesh ---
+    for seg in c_plus_segments:
+        if seg[0][0] <= l and seg[1][0] <= l:
+            ax.plot([seg[0][0], seg[1][0]], [seg[0][1], seg[1][1]], 'k--', lw=0.4, alpha=0.6, label='Right Mach Line')
+    for seg in c_minus_segments:
+        if seg[0][0] <= l and seg[1][0] <= l:
+            ax.plot([seg[0][0], seg[1][0]], [seg[0][1], seg[1][1]], 'k-.', lw=1, alpha=0.6, label='Left Mach Line')
+    # Hatch marks
+    n_hatches = 150
+    hatch_length = .05
+    hatch_lw = 1.
+    # Main line unit tangent and normal
+    d = np.array([x_geom[-1] - x_geom[0] , y_cone[-1] - y_cone[0]])
+    tangent = d / np.linalg.norm(d)
+    normal = np.array([-tangent[1], tangent[0]])
+
+    # Hatch direction: 45 degrees from the main line, toward its upper side
+    theta = np.deg2rad(-45)
+    hatch_dir = np.cos(theta) * tangent + np.sin(theta) * normal
+
+    # Equally spaced hatch starting points
+    s = np.linspace(0.01, 0.99, n_hatches)
+    points = np.array([x_geom[0], y_cone[0]]) + s[:, None] * d
+
+    # Hatch marks extend from the main line at 45 degrees
+    hatches = [
+        [p, p + hatch_length * hatch_dir]
+        for p in points
+    ]
+
+    ax.plot(x_geom, y_cone, 'k-', lw=1.5, label='Cone Surface')
+    ax.plot(x_geom, y_shock, 'k--', lw=1, label='Shock Wave')
+    ax.add_collection(
+        LineCollection(hatches, colors="black", linewidths=hatch_lw))
+    ax.set_xlim(0, l)
+    ax.set_ylim(0, l * np.tan(beta) * 1.05)
+    ax.set_title(f'Characteristic Grid (M = {M_inf}, $\\phi$ = {np.degrees(phi)}$^\\circ$)')
+    ax.grid(False)
+
+    plt.show()
+    
+#----------------------
+# Streamline Tracing
+#-----------------------
+
+if Stream:
+    # RK4 streamline integrator
+    # grid for streamlines/velocity
+    n_grid = 200
+    x_start, x_end = -0.5, l
+    y_start, y_end = 0, y_shock[-1]
+
+    # np.meshgrid(x_vals, y_vals) with default indexing='xy' returns shape (ny, nx)
+    x_vals = np.linspace(x_start, x_end, n_grid)
+    y_vals = np.linspace(y_start, y_end, n_grid)
+    X, Y = np.meshgrid(x_vals, y_vals)
+
+    # 1. Initialize velocity field with freestream conditions everywhere
+    u = np.full_like(X, M_inf * a_o)
+    v = np.zeros_like(Y)
+
+    # 2. Extract scattered MOC points and convert (V, theta) -> (u, v) via Eq. (28)
+    moc_pts = np.array([[pt.x, pt.y] for line in all_lines for pt in line])
+    moc_u = np.array([pt.V * np.cos(pt.theta) for line in all_lines for pt in line])
+    moc_v = np.array([pt.V * np.sin(pt.theta) for line in all_lines for pt in line])
+
+    # 3. Interpolate scattered MOC velocities onto the structured (X, Y) grid
+    u_moc_grid = griddata(moc_pts, moc_u, (X, Y), method='linear')
+    v_moc_grid = griddata(moc_pts, moc_v, (X, Y), method='linear')
+
+    # Define geometric masks on the (X, Y) grid
+    in_shock_layer = (X > 0) & (Y >= X * np.tan(phi)) & (Y <= X * np.tan(beta))
+    in_cone_body = (X > 0) & (Y < X * np.tan(phi))
+
+    # Populate shock layer with MOC interpolated velocities
+    valid_moc = in_shock_layer & ~np.isnan(u_moc_grid)
+    u[valid_moc] = u_moc_grid[valid_moc]
+    v[valid_moc] = v_moc_grid[valid_moc]
+
+    # Fill apex region (0 < X < x_init) in shock layer using Ishimatsu solution
+    fallback_mask = in_shock_layer & np.isnan(u_moc_grid)
+    theta_ray_fb = np.arctan2(Y[fallback_mask], X[fallback_mask])
+    V_fb, th_flow_fb, _, _ = initial_data(theta_ray_fb)
+    u[fallback_mask] = V_fb * np.cos(th_flow_fb)
+    v[fallback_mask] = V_fb * np.sin(th_flow_fb)
+
+    # Fill inside of cone body with wall tangent velocity
+    V_wall, th_wall, _, _ = initial_data(phi)
+    u[in_cone_body] = V_wall * np.cos(th_wall)
+    v[in_cone_body] = V_wall * np.sin(th_wall)
+
+
+    # ---------------------
+    # RK4 STREAMLINES
+    # --------------------
+    # Scale time step by freestream velocity
+    h_stream = 0.005 / (M_inf * a_o)
+    n_steps = 1500
+
+    def calculate_single_streamline_rk4(x_seed, y_seed, h, n_steps, x_range, y_range, u_field, v_field):
+        # RegularGridInterpolator expects (y, x) order for grid points
+        interp_u = RegularGridInterpolator((y_range, x_range), u_field)
+        interp_v = RegularGridInterpolator((y_range, x_range), v_field)
+
+        def get_velocity(point):
+            try:
+                # Interpolator expects [y, x]
+                u_val = interp_u([point[1], point[0]])[0]
+                v_val = interp_v([point[1], point[0]])[0]
+                return np.array([u_val, v_val])
+            except ValueError:
+                # Point is outside the interpolation grid
+                return np.array([np.nan, np.nan])
+
+        streamline_points = np.full((n_steps, 2), np.nan)
+        streamline_points[0] = [x_seed, y_seed]
+        current_point = np.array([x_seed, y_seed], dtype=float)
+
+        # Use grid range bounds 
+        x_min, x_max = x_range[0], x_range[-1]
+        y_min, y_max = y_range[0], y_range[-1]
+
+        for i in range(1, n_steps):
+            k1 = get_velocity(current_point)
+            if np.isnan(k1).any():
+                break
+            k2 = get_velocity(current_point + 0.5 * h * k1)
+            if np.isnan(k2).any():
+                break
+            k3 = get_velocity(current_point + 0.5 * h * k2)
+            if np.isnan(k3).any():
+                break
+            k4 = get_velocity(current_point + h * k3)
+            if np.isnan(k4).any():
+                break
+
+            new_point = current_point + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+            # Check if point left the domain boundaries or inside the cone wall
+            if not (x_min <= new_point[0] <= x_max and y_min <= new_point[1] <= y_max):
+                break
+            if new_point[0] > 0 and new_point[1] < new_point[0] * np.tan(phi):
+                break
+
+            streamline_points[i] = new_point
+            current_point = new_point
+
+        return streamline_points
+#-----------------------
+# plotting 
+#-----------------------
+    if Plot:
+        def add_arrow(line, position=None, direction='right', size=.1, color=None):
+            if color is None:
+                color = line.get_color()
+
+            # Extract line data and filter out trailing NaNs from RK4
+            xdata = np.asarray(line.get_xdata(), dtype=float)
+            ydata = np.asarray(line.get_ydata(), dtype=float)
+            valid = ~(np.isnan(xdata) | np.isnan(ydata))
+            xdata = xdata[valid]
+            ydata = ydata[valid]
+
+            if len(xdata) < 2:
+                return  # Not enough valid points on the streamline to draw an arrow
+
+            if position is None:
+                positions = [xdata.mean()]
+            elif np.ndim(position) == 0:
+                positions = [position]
+            else:
+                positions = position
+
+            for pos in positions:
+                # Skip if the requested x-position is outside this streamline's valid range
+                if not (xdata.min() <= pos <= xdata.max()):
+                    continue
+
+                # Find closest index 
+                start_ind = int(np.argmin(np.abs(xdata - pos)))
+                if direction == 'right':
+                    start_ind = min(start_ind, len(xdata) - 2)
+                    end_ind = start_ind + 1
+                else:
+                    start_ind = max(start_ind, 1)
+                    end_ind = start_ind - 1
+
+                line.axes.annotate(
+                    '',
+                    xytext=(xdata[start_ind], ydata[start_ind]),
+                    xy=(xdata[end_ind], ydata[end_ind]),
+                    arrowprops=dict(arrowstyle="-|>", color=color, lw=1),
+                    size=size
+                )
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+
+        # Trace streamlines from x = -0.5 across a range of starting heights y_seed
+        y_seeds = np.linspace(0.08, y_end * 0.9, 6)
+        for idx, y_seed in enumerate(y_seeds):
+            sl = calculate_single_streamline_rk4(x_start, y_seed, h_stream, n_steps, x_vals, y_vals, u, v)
+            label = 'RK4 Streamlines' if idx == 0 else None
+            
+            # Capture the Line2D handle [0] from ax.plot
+            line = ax.plot(sl[:, 0], sl[:, 1], color='black', lw=1.2, label=label)[0]
+            
+            # Add arrows at points
+            add_arrow(line, position=[0, 1.25, 2.5, 3.75, 4.75], direction='right', size=14, color='black')
+
+        # Plot the geometry
+        ax.plot(x_geom, y_cone, 'k-', lw=1.5, label='Cone Surface')
+        ax.plot(x_geom, y_shock, 'k--', lw=1, label='Shock Wave')
+        ax.add_collection(
+        LineCollection(hatches, colors="black", linewidths=hatch_lw))
+
+        ax.set_xlim(x_start, x_end)
+        ax.set_ylim(y_start, y_end * 1.05)
+        ax.set_title(f'Streamlines ($M_\\infty$ = {M_inf}, $\\phi$ = {np.degrees(phi)}$^\\circ$)')
+        #ax.legend(loc='upper left')
+        ax.grid(False)
+        plt.tight_layout()
+        plt.show()
