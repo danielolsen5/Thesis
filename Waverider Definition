@@ -4,15 +4,14 @@ from dataclasses import dataclass
 from matplotlib.collections import LineCollection
 from scipy.interpolate import RegularGridInterpolator, griddata
 
-
 #----------------------------------
 # Toggle Features
 #----------------------------------
 
-Debug  =True
+Debug  = True
 Grid = False # print figure with grid
-Stream = True # streamline tracing
-Plot = True # plot all figures
+Stream = False # streamline tracing
+Plot = False # plot all figures
 
 #-----------------------------
 # Constants and Freestream
@@ -32,7 +31,7 @@ Free Stream Conditions Based on altitude
 M_inf = 5                                         # Freestream Mach number
 Alt = 15000                                       # Altitude (m)
 T_o = 288.15 + (L*Alt)                            # Freestream temperature (K)
-g = 9.81 * (1+ (Alt/6371000))**(-2)                 # Gravitational Acceleration at altitude (m/s^2)
+g = 9.81 * (1+ (Alt/6371000))**(-2)               # Gravitational Acceleration at altitude (m/s^2)
 p_o = 101325 *(T_o/288.15)**(-g/(R*L))            # Freestream pressure (Pa)
 rho_o = (p_o / (R * T_o))                         # Freestream density (kg/m^3)
 a_o = np.sqrt(gamma * R * T_o)                    # Freestream speed of sound (m/s)
@@ -75,8 +74,8 @@ if Debug:
 #----------------------------------------------
 # Finite Difference step and initial point
 #----------------------------------------------
-x_init = .05
-num_pts = 20
+x_init = .1
+num_pts = 15
 
 #--------------------
 # Structure Data
@@ -395,7 +394,61 @@ while current_line[0].x < l:
     next_line = [wall_pt] + interior_pts + [shock_pt]
     all_lines.append(next_line)
     current_line = next_line
-    
+
+# check flow properties at a point
+x_check = 3
+y_check = .5
+
+def check_flow_point(x_check: float, y_check: float, all_lines: list, method: str = 'linear'):
+# 2. put variables into 1D arrays
+    moc_pts = np.array([[pt.x, pt.y] for line in all_lines for pt in line])
+        # Stack [V, theta, p, rho] into an (N, 4) array to interpolate all 4 variables at once
+    moc_states = np.array([[pt.V, pt.theta, pt.p, pt.rho] for line in all_lines for pt in line])
+
+    interp_vals = griddata(moc_pts, moc_states, [(x_check, y_check)], method=method)[0]
+
+    V_val, th_val, p_val, rho_val = interp_vals
+
+        # Compute properties
+    a_val = np.sqrt(gamma * p_val / rho_val)
+    M_val = V_val / a_val
+    T_val = p_val / (rho_val * R)
+    u_val = V_val * np.cos(th_val)
+    v_val = V_val * np.sin(th_val)
+
+        # Compare against taylor maccoll
+    theta_ray = np.arctan2(y_check, x_check)
+    V_ana, th_ana, p_ana, rho_ana = initial_data(theta_ray)
+
+        # Print readout
+    print("=" * 62)
+    print(f"Check at (x = {x_check:.4f} m, y = {y_check:.4f} m | Ray = {np.degrees(theta_ray):.2f} deg)")
+    print("=" * 62)
+    print(f"  {'Property':<18} | {'MOC Interpolated':<18} | {'Taylor Maccoll':<18}")
+    print("-" * 62)
+    print(f"  {'V (m/s)':<18} | {V_val:<18.4f} | {V_ana:<18.4f}")
+    print(f"  {'u (m/s)':<18} | {u_val:<18.4f} | {V_ana * np.cos(th_ana):<18.4f}")
+    print(f"  {'v (m/s)':<18} | {v_val:<18.4f} | {V_ana * np.sin(th_ana):<18.4f}")
+    print(f"  {'theta (deg)':<18} | {np.degrees(th_val):<18.4f} | {np.degrees(th_ana):<18.4f}")
+    print(f"  {'Mach (M)':<18} | {M_val:<18.4f} | {V_ana / np.sqrt(gamma * p_ana / rho_ana):<18.4f}")
+    print(f"  {'p (Pa)':<18} | {p_val:<18.2f} | {p_ana:<18.2f}")
+    print(f"  {'p / p_inf':<18} | {p_val / p_o:<18.4f} | {p_ana / p_o:<18.4f}")
+    print(f"  {'rho (kg/m^3)':<18} | {rho_val:<18.5f} | {rho_ana:<18.5f}")
+    print(f"  {'T (K)':<18} | {T_val:<18.2f} | {p_ana / (rho_ana * R):<18.2f}")
+    print("=" * 62)
+
+    return {
+        "x": x_check, "y": y_check,
+        "V": V_val, "u": u_val, "v": v_val,
+        "theta_rad": th_val, "theta_deg": np.degrees(th_val),
+        "M": M_val, "a": a_val,
+        "p": p_val, "rho": rho_val, "T": T_val
+    }
+if Debug:
+    check_results = check_flow_point(x_check, y_check, all_lines) 
+    total_nodes = sum(len(line) for line in all_lines)
+    nodes_in_domain = sum(1 for line in all_lines for pt in line if pt.x <= l)
+    print(f"MOC nodes: {total_nodes} ({nodes_in_domain} inside x <= {l} m)")
 #---------------------------
 # MOC Visualization
 # -------------------------
